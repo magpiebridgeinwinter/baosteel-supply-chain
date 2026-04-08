@@ -672,24 +672,39 @@ def main():
                                     else:
                                         real_preds = [0, 0, 0]
                                 
-                                # 生成预测日期 (基于当前年份和月份)
-                                import datetime
-                                current_date = datetime.datetime.now()
-                                # 预测未来3个月
-                                prediction_dates = []
-                                for i in range(3):
-                                    pred_date = current_date + datetime.timedelta(days=30*i)
-                                    prediction_dates.append(pred_date.strftime('%Y-%m'))
-                                
-                                # 存储每个月的预测结果
-                                for i, (pred_date, pred_val) in enumerate(zip(prediction_dates, real_preds)):
-                                    cursor.execute(
-                                        "INSERT OR REPLACE INTO prediction_results (base_name, region_code, sku, prediction_date, pred_value, is_fallback, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                        (base_name, region_code, sku_str, pred_date, float(pred_val), 1 if is_fallback else 0, time.strftime("%Y-%m-%d %H:%M:%S"))
-                                    )
-                                
-                                current += 1
-                                progress_bar.progress(current / total_items)
+                        # 找到数据集中的最新日期
+                        if not monthly_df.empty:
+                            latest_period = monthly_df['year_month'].max()
+                            # 转换为datetime对象
+                            latest_date = latest_period.to_timestamp()
+                        else:
+                            # 如果数据为空，使用当前日期作为备选
+                            import datetime
+                            latest_date = datetime.datetime.now()
+                        
+                        # 生成预测日期 (基于数据集中的最新日期)
+                        prediction_dates = []
+                        prediction_date_objects = []
+                        for i in range(3):
+                            # 计算下一个月
+                            if i == 0:
+                                # 第一个预测月份是最新数据月份的下一个月
+                                pred_date = latest_date + pd.DateOffset(months=1)
+                            else:
+                                # 后续月份
+                                pred_date = prediction_date_objects[i-1] + pd.DateOffset(months=1)
+                            prediction_date_objects.append(pred_date)
+                            prediction_dates.append(pred_date.strftime('%Y-%m'))
+                        
+                        # 存储每个月的预测结果
+                        for i, (pred_date, pred_val) in enumerate(zip(prediction_dates, real_preds)):
+                            cursor.execute(
+                                "INSERT OR REPLACE INTO prediction_results (base_name, region_code, sku, prediction_date, pred_value, is_fallback, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (base_name, region_code, sku_str, pred_date, float(pred_val), 1 if is_fallback else 0, time.strftime("%Y-%m-%d %H:%M:%S"))
+                            )
+                        
+                        current += 1
+                        progress_bar.progress(current / total_items)
                         
                         conn.commit()
                         
