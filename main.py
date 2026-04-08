@@ -616,16 +616,14 @@ def main():
                                 base_name TEXT NOT NULL,
                                 region_code INTEGER NOT NULL,
                                 sku TEXT NOT NULL,
-                                prediction_date TEXT NOT NULL,  -- 预测日期 (YYYY-MM)
-                                pred_value REAL NOT NULL,       -- 预测值
-                                is_fallback INTEGER NOT NULL,   -- 是否为兜底预测
-                                created_at TEXT NOT NULL,        -- 创建时间
-                                UNIQUE(base_name, sku, prediction_date)
+                                month_201901 REAL NOT NULL,
+                                month_201902 REAL NOT NULL,
+                                month_201903 REAL NOT NULL,
+                                is_fallback INTEGER NOT NULL,
+                                timestamp TEXT NOT NULL,
+                                UNIQUE(base_name, sku)
                             )
                         ''')
-                        # 创建索引以提高查询性能
-                        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prediction_date ON prediction_results(prediction_date)')
-                        cursor.execute('CREATE INDEX IF NOT EXISTS idx_base_sku_date ON prediction_results(base_name, sku, prediction_date)')
                         
                         cursor.execute("DELETE FROM prediction_results")
                         conn.commit()
@@ -672,39 +670,13 @@ def main():
                                     else:
                                         real_preds = [0, 0, 0]
                                 
-                        # 找到数据集中的最新日期
-                        if not monthly_df.empty:
-                            latest_period = monthly_df['year_month'].max()
-                            # 转换为datetime对象
-                            latest_date = latest_period.to_timestamp()
-                        else:
-                            # 如果数据为空，使用当前日期作为备选
-                            import datetime
-                            latest_date = datetime.datetime.now()
-                        
-                        # 生成预测日期 (基于数据集中的最新日期)
-                        prediction_dates = []
-                        prediction_date_objects = []
-                        for i in range(3):
-                            # 计算下一个月
-                            if i == 0:
-                                # 第一个预测月份是最新数据月份的下一个月
-                                pred_date = latest_date + pd.DateOffset(months=1)
-                            else:
-                                # 后续月份
-                                pred_date = prediction_date_objects[i-1] + pd.DateOffset(months=1)
-                            prediction_date_objects.append(pred_date)
-                            prediction_dates.append(pred_date.strftime('%Y-%m'))
-                        
-                        # 存储每个月的预测结果
-                        for i, (pred_date, pred_val) in enumerate(zip(prediction_dates, real_preds)):
-                            cursor.execute(
-                                "INSERT OR REPLACE INTO prediction_results (base_name, region_code, sku, prediction_date, pred_value, is_fallback, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                (base_name, region_code, sku_str, pred_date, float(pred_val), 1 if is_fallback else 0, time.strftime("%Y-%m-%d %H:%M:%S"))
-                            )
-                        
-                        current += 1
-                        progress_bar.progress(current / total_items)
+                                cursor.execute(
+                                    "INSERT OR REPLACE INTO prediction_results (base_name, region_code, sku, month_201901, month_201902, month_201903, is_fallback, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (base_name, region_code, sku_str, float(real_preds[0]), float(real_preds[1]), float(real_preds[2]), 1 if is_fallback else 0, time.strftime("%Y-%m-%d %H:%M:%S"))
+                                )
+                                
+                                current += 1
+                                progress_bar.progress(current / total_items)
                         
                         conn.commit()
                         
@@ -734,12 +706,13 @@ def main():
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         base_name TEXT NOT NULL,
                         region_code INTEGER NOT NULL,
-                        sku TEXT NOT NULL,
-                        prediction_date TEXT NOT NULL,  -- 预测日期 (YYYY-MM)
-                        pred_value REAL NOT NULL,       -- 预测值
-                        is_fallback INTEGER NOT NULL,   -- 是否为兜底预测
-                        created_at TEXT NOT NULL,        -- 创建时间
-                        UNIQUE(base_name, sku, prediction_date)
+                        sku INTEGER NOT NULL,
+                        month_201901 INTEGER NOT NULL,
+                        month_201902 INTEGER NOT NULL,
+                        month_201903 INTEGER NOT NULL,
+                        is_fallback INTEGER NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        UNIQUE(base_name, sku)
                     )
                 ''')
                 
@@ -751,8 +724,7 @@ def main():
                     
                     selected_base = st.selectbox("选择基地", bases)
                     
-                    # 获取该基地的所有SKU（去重）
-                    cursor.execute("SELECT DISTINCT sku FROM prediction_results WHERE base_name = ?", (selected_base,))
+                    cursor.execute("SELECT sku FROM prediction_results WHERE base_name = ?", (selected_base,))
                     skus_in_base = [row[0] for row in cursor.fetchall()]
                     st.info(f"当前基地共有 {len(skus_in_base)} 个SKU")
                     
@@ -762,38 +734,29 @@ def main():
                         if view_mode == "单个SKU":
                             selected_sku = st.selectbox("选择SKU", skus_in_base)
                             
-                            # 获取该SKU的所有预测月份
-                            cursor.execute(
-                                "SELECT DISTINCT prediction_date FROM prediction_results WHERE base_name = ? AND sku = ? ORDER BY prediction_date",
-                                (selected_base, selected_sku)
-                            )
-                            months = [row[0] for row in cursor.fetchall()]
+                            selected_month = st.selectbox("选择月份", ["全部", "2019-01", "2019-02", "2019-03"])
                             
-                            if months:
-                                selected_month = st.selectbox("选择月份", ["全部"] + months)
-                                
-                                # 获取预测结果
+                            if selected_sku:
                                 cursor.execute(
-                                    "SELECT prediction_date, pred_value FROM prediction_results WHERE base_name = ? AND sku = ? ORDER BY prediction_date",
+                                    "SELECT month_201901, month_201902, month_201903 FROM prediction_results WHERE base_name = ? AND sku = ?", 
                                     (selected_base, selected_sku)
                                 )
-                                results = cursor.fetchall()
+                                result = cursor.fetchone()
                                 
-                                if results:
-                                    # 构建月份到预测值的映射
-                                    pred_dict = {row[0]: row[1] for row in results}
-                                    display_months = months if selected_month == "全部" else [selected_month]
+                                if result:
+                                    preds = [result[0], result[1], result[2]]
+                                    months = ["2019-01", "2019-02", "2019-03"]
                                     
-                                    # 显示指标卡片
                                     col_metric1, col_metric2, col_metric3 = st.columns(3)
-                                    for i, month in enumerate(display_months[:3]):  # 最多显示3个月份
-                                        metric_val = f"{pred_dict.get(month, 0):.0f} 吨"
-                                        if i == 0:
-                                            col_metric1.metric(f"📅 {month}", metric_val, "预测值")
-                                        elif i == 1:
-                                            col_metric2.metric(f"📅 {month}", metric_val, "预测值")
-                                        else:
-                                            col_metric3.metric(f"📅 {month}", metric_val, "预测值")
+                                    for i, month in enumerate(months):
+                                        if selected_month == "全部" or selected_month == month:
+                                            metric_val = f"{preds[i]:.0f} 吨"
+                                            if i == 0:
+                                                col_metric1.metric(f"📅 {month}", metric_val, "预测值")
+                                            elif i == 1:
+                                                col_metric2.metric(f"📅 {month}", metric_val, "预测值")
+                                            else:
+                                                col_metric3.metric(f"📅 {month}", metric_val, "预测值")
                                     
                                     region_code_for_query = [k for k, v in REGION_MAP.items() if v == selected_base]
                                     
@@ -802,59 +765,50 @@ def main():
                                         (monthly_df['item_code'].apply(lambda x: str(x) == selected_sku))
                                     ].copy()
                                     
-                                    # 获取历史月份和预测月份
-                                    if not hist_for_chart.empty:
-                                        hist_months = sorted(hist_for_chart['year_month'].astype(str).unique())
-                                    else:
-                                        hist_months = []
-                                    pred_months = sorted(pred_dict.keys())
+                                    hist_months = ['2018-01', '2018-02', '2018-03', '2018-04', '2018-05', '2018-06',
+                                                   '2018-07', '2018-08', '2018-09', '2018-10', '2018-11', '2018-12']
+                                    pred_months = ['2019-01', '2019-02', '2019-03']
                                     
-                                    # 构建历史数据映射
+                                    fig = go.Figure()
+                                    
                                     hist_values_map = {}
                                     for _, row in hist_for_chart.iterrows():
                                         ym_str = str(row['year_month'])
                                         hist_values_map[ym_str] = float(row['ord_qty'])
                                     
-                                    fig = go.Figure()
+                                    hist_values_list = []
+                                    for hm in hist_months:
+                                        found = False
+                                        for ym_key, val in hist_values_map.items():
+                                            if hm in ym_key or ym_key.startswith(hm):
+                                                hist_values_list.append(val)
+                                                found = True
+                                                break
+                                        if not found:
+                                            hist_values_list.append(None)
                                     
-                                    # 历史数据（蓝色）
-                                    if hist_months:
-                                        hist_values_list = []
-                                        for hm in hist_months:
-                                            found = False
-                                            for ym_key, val in hist_values_map.items():
-                                                if hm in ym_key or ym_key.startswith(hm):
-                                                    hist_values_list.append(val)
-                                                    found = True
-                                                    break
-                                            if not found:
-                                                hist_values_list.append(None)
-                                        
-                                        has_hist_data = any(v is not None for v in hist_values_list)
-                                        
-                                        if has_hist_data:
-                                            fig.add_trace(go.Scatter(
-                                                x=hist_months,
-                                                y=hist_values_list,
-                                                mode='lines+markers',
-                                                name='🔵 历史实际值',
-                                                line=dict(color='#1E88E5', width=3),
-                                                marker=dict(color='#1E88E5', size=8),
-                                                fill='tozeroy',
-                                                fillcolor='rgba(30,136,229,0.08)'
-                                            ))
+                                    has_hist_data = any(v is not None for v in hist_values_list)
                                     
-                                    # 预测数据（红色）
-                                    if pred_months:
-                                        pred_values = [pred_dict.get(m, 0) for m in pred_months]
+                                    if has_hist_data:
                                         fig.add_trace(go.Scatter(
-                                            x=pred_months,
-                                            y=pred_values,
+                                            x=hist_months,
+                                            y=hist_values_list,
                                             mode='lines+markers',
-                                            name='🔴 预测值',
-                                            line=dict(color='#E53935', width=3, dash='dash'),
-                                            marker=dict(color='#E53935', size=10, symbol='diamond')
+                                            name='🔵 历史实际值',
+                                            line=dict(color='#1E88E5', width=3),
+                                            marker=dict(color='#1E88E5', size=8),
+                                            fill='tozeroy',
+                                            fillcolor='rgba(30,136,229,0.08)'
                                         ))
+                                    
+                                    fig.add_trace(go.Scatter(
+                                        x=pred_months,
+                                        y=[float(p) for p in preds],
+                                        mode='lines+markers',
+                                        name='🔴 预测值',
+                                        line=dict(color='#E53935', width=3, dash='dash'),
+                                        marker=dict(color='#E53935', size=10, symbol='diamond')
+                                    ))
                                     
                                     fig.update_layout(
                                         title=dict(text=f'<b>SKU {selected_sku}</b> — 需求趋势与预测', font_size=18, x=0.5, xanchor='center'),
@@ -875,11 +829,12 @@ def main():
                                     st.markdown("### 📋 预测结果明细")
                                     
                                     result_data = []
-                                    for month in display_months:
-                                        result_data.append({
-                                            '月份': month,
-                                            '预测值 (吨)': float(pred_dict.get(month, 0))
-                                        })
+                                    for i, month in enumerate(months):
+                                        if selected_month == "全部" or selected_month == month:
+                                            result_data.append({
+                                                '月份': month,
+                                                '预测值 (吨)': float(preds[i])
+                                            })
                                     
                                     st.dataframe(
                                         result_data,
@@ -892,133 +847,101 @@ def main():
                                     )
                                 else:
                                     st.warning("未找到该SKU的预测数据")
-                            else:
-                                st.warning("该SKU暂无预测数据")
                         
                         elif view_mode == "基地全部SKU汇总":
                             st.markdown(f"### 📊 {selected_base} — 全部SKU预测结果")
                             
-                            # 获取该基地的所有预测月份
                             cursor.execute(
-                                "SELECT DISTINCT prediction_date FROM prediction_results WHERE base_name = ? ORDER BY prediction_date",
+                                "SELECT sku, month_201901, month_201902, month_201903 FROM prediction_results WHERE base_name = ? ORDER BY sku",
                                 (selected_base,)
                             )
-                            base_months = [row[0] for row in cursor.fetchall()]
+                            all_results = cursor.fetchall()
                             
-                            if base_months:
-                                # 获取所有SKU的预测数据
-                                cursor.execute(
-                                    "SELECT sku, prediction_date, pred_value FROM prediction_results WHERE base_name = ? ORDER BY sku, prediction_date",
-                                    (selected_base,)
-                                )
-                                all_results = cursor.fetchall()
+                            if all_results:
+                                all_sku_data = []
+                                total_01, total_02, total_03 = 0, 0, 0
+                                for row in all_results:
+                                    sku_val = str(row[0])
+                                    v1 = row[1] if row[1] is not None else 0
+                                    v2 = row[2] if row[2] is not None else 0
+                                    v3 = row[3] if row[3] is not None else 0
+                                    all_sku_data.append({
+                                        'SKU': sku_val,
+                                        '1月预测(吨)': float(v1),
+                                        '2月预测(吨)': float(v2),
+                                        '3月预测(吨)': float(v3),
+                                        '合计(吨)': float(v1) + float(v2) + float(v3)
+                                    })
+                                    total_01 += float(v1)
+                                    total_02 += float(v2)
+                                    total_03 += float(v3)
                                 
-                                if all_results:
-                                    # 构建数据结构
-                                    sku_data = {}
-                                    month_totals = {month: 0 for month in base_months}
-                                    
-                                    for row in all_results:
-                                        sku_val = str(row[0])
-                                        month = row[1]
-                                        value = row[2] if row[2] is not None else 0
-                                        
-                                        if sku_val not in sku_data:
-                                            sku_data[sku_val] = {}
-                                        sku_data[sku_val][month] = value
-                                        month_totals[month] += value
-                                    
-                                    # 计算总和
-                                    total_sum = sum(month_totals.values())
-                                    
-                                    # 显示汇总卡片
-                                    sm1, sm2, sm3, sm4 = st.columns(4, gap="small")
-                                    for i, (month, total) in enumerate(month_totals.items()):
-                                        if i == 0:
-                                            sm1.metric(f"📅 {month}", f"{total:,.0f} 吨", delta_color="off")
-                                        elif i == 1:
-                                            sm2.metric(f"📅 {month}", f"{total:,.0f} 吨", delta_color="off")
-                                        elif i == 2:
-                                            sm3.metric(f"📅 {month}", f"{total:,.0f} 吨", delta_color="off")
-                                    sm4.metric("📈 合计", f"{total_sum:,.0f} 吨", delta_color="normal")
-                                    
-                                    # 准备图表数据
-                                    pred_months = sorted(base_months)
-                                    month_totals_list = [month_totals[m] for m in pred_months]
-                                    
-                                    fig_line = go.Figure()
-                                    fig_line.add_trace(go.Scatter(
-                                        x=pred_months,
-                                        y=month_totals_list,
-                                        mode='lines+markers+text',
-                                        name='📈 月度预测总量',
-                                        line=dict(color='#E53935', width=4),
-                                        marker=dict(color='#E53935', size=12, symbol='circle'),
-                                        text=[f'{v:,.0f}' for v in month_totals_list],
-                                        textposition='top center',
-                                        textfont=dict(size=13, color='#333', family='Arial Black'),
-                                        fill='tozeroy',
-                                        fillcolor='rgba(229,57,53,0.08)'
-                                    ))
-                                    
-                                    fig_line.update_layout(
-                                        title=dict(text=f'<b>{selected_base}</b> 月度预测趋势', font_size=17, x=0.5, xanchor='center'),
-                                        xaxis_title='月份',
-                                        yaxis_title='订单量 (吨)',
-                                        template='plotly_white',
-                                        hovermode='x unified',
-                                        height=420,
-                                        margin=dict(t=60, b=60, l=70, r=40),
-                                        plot_bgcolor='#FAFAFA'
+                                sm1, sm2, sm3, sm4 = st.columns(4, gap="small")
+                                sm1.metric("📅 1月总计", f"{total_01:,.0f} 吨", delta_color="off")
+                                sm2.metric("📅 2月总计", f"{total_02:,.0f} 吨", delta_color="off")
+                                sm3.metric("📅 3月总计", f"{total_03:,.0f} 吨", delta_color="off")
+                                sm4.metric("📈 季度合计", f"{total_01+total_02+total_03:,.0f} 吨", delta_color="normal")
+                                
+                                pred_months = ['2019-01', '2019-02', '2019-03']
+                                month_totals = [total_01, total_02, total_03]
+                                
+                                fig_line = go.Figure()
+                                fig_line.add_trace(go.Scatter(
+                                    x=pred_months,
+                                    y=month_totals,
+                                    mode='lines+markers+text',
+                                    name='📈 月度预测总量',
+                                    line=dict(color='#E53935', width=4),
+                                    marker=dict(color='#E53935', size=12, symbol='circle'),
+                                    text=[f'{v:,.0f}' for v in month_totals],
+                                    textposition='top center',
+                                    textfont=dict(size=13, color='#333', family='Arial Black'),
+                                    fill='tozeroy',
+                                    fillcolor='rgba(229,57,53,0.08)'
+                                ))
+                                
+                                fig_line.update_layout(
+                                    title=dict(text=f'<b>{selected_base}</b> 月度预测趋势', font_size=17, x=0.5, xanchor='center'),
+                                    xaxis_title='月份',
+                                    yaxis_title='订单量 (吨)',
+                                    template='plotly_white',
+                                    hovermode='x unified',
+                                    height=420,
+                                    margin=dict(t=60, b=60, l=70, r=40),
+                                    plot_bgcolor='#FAFAFA'
+                                )
+                                fig_line.update_xaxes(tickfont=dict(size=12))
+                                fig_line.update_yaxes(gridcolor='#E0E0E0')
+                                st.plotly_chart(fig_line, use_container_width=True)
+                                
+                                st.markdown("---")
+                                st.markdown("### 📋 全部SKU明细")
+                                
+                                col_tbl, col_dl = st.columns([4, 1], gap="small")
+                                
+                                with col_tbl:
+                                    st.dataframe(
+                                        pd.DataFrame(all_sku_data),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        height=400,
+                                        column_config={
+                                            'SKU': st.column_config.TextColumn('SKU编码', width='medium'),
+                                            '1月预测(吨)': st.column_config.NumberColumn('1月预测(吨)', format="%.0f"),
+                                            '2月预测(吨)': st.column_config.NumberColumn('2月预测(吨)', format="%.0f"),
+                                            '3月预测(吨)': st.column_config.NumberColumn('3月预测(吨)', format="%.0f"),
+                                            '合计(吨)': st.column_config.NumberColumn('合计(吨)', format="%.0f")
+                                        }
                                     )
-                                    fig_line.update_xaxes(tickfont=dict(size=12))
-                                    fig_line.update_yaxes(gridcolor='#E0E0E0')
-                                    st.plotly_chart(fig_line, use_container_width=True)
-                                    
-                                    st.markdown("---")
-                                    st.markdown("### 📋 全部SKU明细")
-                                    
-                                    col_tbl, col_dl = st.columns([4, 1], gap="small")
-                                    
-                                    # 准备表格数据
-                                    all_sku_data = []
-                                    for sku_val, month_values in sku_data.items():
-                                        row = {'SKU': sku_val}
-                                        sku_total = 0
-                                        for month in base_months:
-                                            val = month_values.get(month, 0)
-                                            row[f'{month}预测(吨)'] = float(val)
-                                            sku_total += val
-                                        row['合计(吨)'] = float(sku_total)
-                                        all_sku_data.append(row)
-                                    
-                                    with col_tbl:
-                                        st.dataframe(
-                                            pd.DataFrame(all_sku_data),
-                                            use_container_width=True,
-                                            hide_index=True,
-                                            height=400
-                                        )
-                                    
-                                    with col_dl:
-                                        # 准备导出数据
-                                        export_data = []
-                                        for sku_val, month_values in sku_data.items():
-                                            for month in base_months:
-                                                export_data.append({
-                                                    '基地': selected_base,
-                                                    'SKU': sku_val,
-                                                    '月份': month,
-                                                    '预测值(吨)': month_values.get(month, 0)
-                                                })
-                                        
-                                        st.download_button(
-                                            label=f"📥 导出CSV",
-                                            data=pd.DataFrame(export_data).to_csv(index=False).encode('utf-8'),
-                                            file_name=f"{selected_base}_全部SKU预测.csv",
-                                            mime="text/csv",
-                                            use_container_width=True
-                                        )
+                                
+                                with col_dl:
+                                    st.download_button(
+                                        label=f"📥 导出CSV",
+                                        data=pd.DataFrame(all_sku_data).to_csv(index=False).encode('utf-8'),
+                                        file_name=f"{selected_base}_全部SKU预测.csv",
+                                        mime="text/csv",
+                                        use_container_width=True
+                                    )
                             else:
                                 st.warning("该基地暂无预测数据")
                     else:
