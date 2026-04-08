@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import torch
 import time
+import sqlite3
 from models import TCN
 from utils import REGION_MAP
 
@@ -86,6 +87,11 @@ st.markdown("""
 # ==========================================
 # 3. 核心界面逻辑
 # ==========================================
+# SQLite数据库配置
+DB_CONFIG = {
+    'db_path': 'baosteel_prediction.db'
+}
+
 def main():
     # --- 侧边栏 ---
     st.sidebar.title("宝钢智能决策中心")
@@ -94,7 +100,6 @@ def main():
 
     menu = st.sidebar.radio("系统模块", ["📊 全局运营看板", "🤖 智能订单预测"])
     st.sidebar.markdown("---")
-    st.sidebar.info("当前模型: TCN-DeepV3\n数据版本: 2018-12-20")
 
     # 加载资源
     raw_df, monthly_df, error_msg = load_and_process_data()
@@ -106,66 +111,456 @@ def main():
 
     # --- 模块 1: 看板 ---
     if menu == "📊 全局运营看板":
-        st.title("📊 宝钢汽车板产销监控大屏")
+        st.title("📊 宝钢汽车板产销预测")
 
-        # KPI Cards (HTML)
         total_vol = raw_df['ord_qty'].sum() / 10000
-        avg_price = raw_df['item_price'].mean()
+        avg_price = raw_df['item_price'].mean() * 3
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(
-            f'<div class="metric-card"><div class="metric-label">累计总销量</div><div class="metric-value">{total_vol:,.2f}</div><div class="metric-label">万吨</div></div>',
-            unsafe_allow_html=True)
-        c2.markdown(
-            f'<div class="metric-card"><div class="metric-label">SKU覆盖数</div><div class="metric-value">{raw_df["item_code"].nunique()}</div><div class="metric-label">个</div></div>',
-            unsafe_allow_html=True)
-        c3.markdown(
-            f'<div class="metric-card"><div class="metric-label">平均挂牌价</div><div class="metric-value">¥{avg_price:,.0f}</div><div class="metric-label">元/吨</div></div>',
-            unsafe_allow_html=True)
-        c4.markdown(
-            f'<div class="metric-card"><div class="metric-label">预测覆盖率</div><div class="metric-value">98.5%</div><div class="metric-label">TCN模型支持</div></div>',
-            unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("📦 累计总销量", f"{total_vol:,.2f}", "万吨")
+        c2.metric("🏷️ SKU覆盖数", f"{raw_df['item_code'].nunique()}", "个")
+        c3.metric("💰 平均挂牌价", f"¥{avg_price:,.0f}", "元/吨")
 
         st.markdown("---")
-
-        col_chart1, col_chart2 = st.columns([2, 1])
-        with col_chart1:
-            # 趋势图
-            trend = raw_df.groupby(raw_df['year_month'].astype(str))['ord_qty'].sum().reset_index()
-            fig = px.area(trend, x='year_month', y='ord_qty', title='月度总需求量走势 (全基地)', markers=True)
-            fig.update_layout(xaxis_title="月份", yaxis_title="销量 (吨)", template="plotly_white")
-            st.plotly_chart(fig, use_container_width=True)
-        with col_chart2:
-            # 基地分布
-            pie = raw_df.groupby('base_name')['ord_qty'].sum().reset_index()
-            fig2 = px.pie(pie, values='ord_qty', names='base_name', title='各基地产能负荷', hole=0.4)
-            st.plotly_chart(fig2, use_container_width=True)
-
-        # 数据表格展示
-        st.markdown("---")
-        st.subheader("📋 销售数据明细")
         
-        # 数据过滤选项
+        dim_tab, space_tab = st.tabs(["🕐 时间维度分析", "🗺️ 空间维度分析"])
+        
+        with dim_tab:
+            time_mode = st.radio("时间粒度", ["📅 按月查看", "📆 按年查看"], horizontal=True)
+            
+            if time_mode == "📅 按月查看":
+                all_months_sorted = sorted(raw_df['year_month'].astype(str).unique())
+                default_start = max(0, len(all_months_sorted) - 12)
+                
+                col_start, col_end = st.columns(2)
+                with col_start:
+                    start_idx = st.selectbox(
+                        "起始月份",
+                        range(len(all_months_sorted)),
+                        index=default_start,
+                        format_func=lambda x: all_months_sorted[x]
+                    )
+                with col_end:
+                    end_idx = st.selectbox(
+                        "结束月份",
+                        range(len(all_months_sorted)),
+                        index=len(all_months_sorted) - 1,
+                        format_func=lambda x: all_months_sorted[x]
+                    )
+                
+                start_idx, end_idx = min(start_idx, end_idx), max(start_idx, end_idx)
+                start_month = all_months_sorted[start_idx]
+                end_month = all_months_sorted[end_idx]
+                
+                time_filtered = raw_df[
+                    (raw_df['year_month'].astype(str) >= start_month) &
+                    (raw_df['year_month'].astype(str) <= end_month)
+                ]
+                
+                monthly_trend = time_filtered.groupby(time_filtered['year_month'].astype(str)).agg({
+                    'ord_qty': 'sum',
+                    'item_price': 'mean'
+                }).reset_index()
+                
+                fig_time = go.Figure()
+                fig_time.add_trace(go.Scatter(
+                    x=monthly_trend['year_month'],
+                    y=monthly_trend['ord_qty'] / 10000,
+                    mode='lines+markers+text',
+                    name='月度销量',
+                    line=dict(color='#1E88E5', width=3),
+                    marker=dict(color='#1E88E5', size=8),
+                    text=[f'{v/10000:.1f}' for v in monthly_trend['ord_qty']],
+                    textposition='top center',
+                    textfont=dict(size=9)
+                ))
+                fig_time.update_layout(
+                    title=dict(text=f'<b>{start_month} ~ {end_month}</b> 月度销量趋势', font_size=16, x=0.5),
+                    xaxis_title='月份',
+                    yaxis_title='销量 (万吨)',
+                    template='plotly_white',
+                    hovermode='x unified',
+                    height=420,
+                    margin=dict(t=50, b=60, l=70, r=30),
+                    plot_bgcolor='#FAFAFA'
+                )
+                fig_time.update_xaxes(tickangle=-35, tickfont=dict(size=10))
+                fig_time.update_yaxes(gridcolor='#E0E0E0')
+                st.plotly_chart(fig_time, use_container_width=True)
+                
+                col_fig2, col_fig3 = st.columns(2)
+                with col_fig2:
+                    price_fig = go.Figure()
+                    price_fig.add_trace(go.Bar(
+                        x=monthly_trend['year_month'],
+                        y=monthly_trend['item_price'] * 3,
+                        name='平均价格',
+                        marker_color='#66BB6A',
+                        text=[f'¥{v*3:.0f}' for v in monthly_trend['item_price']],
+                        textposition='outside',
+                        textfont=dict(size=9)
+                    ))
+                    price_fig.update_layout(
+                        title='<b>月度平均价格趋势</b>',
+                        yaxis_title='价格 (元/吨)',
+                        template='plotly_white',
+                        height=380,
+                        plot_bgcolor='#FAFAFA',
+                        margin=dict(t=45, b=50, l=55, r=20)
+                    )
+                    price_fig.update_xaxes(tickangle=-35, tickfont=dict(size=9))
+                    price_fig.update_yaxes(gridcolor='#E0E0E0')
+                    st.plotly_chart(price_fig, use_container_width=True)
+                
+                with col_fig3:
+                    sku_monthly = time_filtered.groupby('item_code')['ord_qty'].sum().nlargest(5).reset_index()
+                    sku_top_fig = go.Figure()
+                    sku_top_fig.add_trace(go.Bar(
+                        y=sku_monthly['item_code'].astype(str),
+                        x=sku_monthly['ord_qty'],
+                        orientation='h',
+                        marker_color='#FFA726',
+                        text=[f'{v:.0f}' for v in sku_monthly['ord_qty']],
+                        textposition='outside',
+                        textfont=dict(size=9)
+                    ))
+                    sku_top_fig.update_layout(
+                        title='<b>Top 5 销售SKU</b>',
+                        xaxis_title='销量 (吨)',
+                        template='plotly_white',
+                        height=380,
+                        plot_bgcolor='#FAFAFA',
+                        margin=dict(t=45, b=50, l=80, r=20)
+                    )
+                    sku_top_fig.update_yaxes(tickfont=dict(size=9))
+                    sku_top_fig.update_xaxes(gridcolor='#E0E0E0')
+                    st.plotly_chart(sku_top_fig, use_container_width=True)
+            
+            elif time_mode == "📆 按年查看":
+                raw_df['year'] = raw_df['order_date'].dt.year
+                
+                year_list = sorted(raw_df['year'].unique())
+                selected_years = st.multiselect(
+                    "选择年份（支持多选对比）",
+                    options=year_list,
+                    default=year_list[-min(5, len(year_list)):]
+                )
+                
+                if selected_years:
+                    year_data = raw_df[raw_df['year'].isin(selected_years)]
+                    
+                    yearly_agg = year_data.groupby('year').agg({
+                        'ord_qty': 'sum',
+                        'item_price': 'mean',
+                        'item_code': 'nunique',
+                        'order_date': 'count'
+                    }).reset_index()
+                    yearly_agg.columns = ['年份', '总销量', '平均价格', 'SKU数', '订单数']
+                    
+                    col_y1, col_y2 = st.columns(2)
+                    with col_y1:
+                        fig_year_vol = go.Figure()
+                        colors_year = ['#1E88E5', '#43A047', '#F4511E', '#8E24AA', '#D81B60']
+                        for i, yr in enumerate(sorted(selected_years)):
+                            yr_data = yearly_agg[yearly_agg['年份'] == yr]
+                            if len(yr_data) > 0:
+                                fig_year_vol.add_trace(go.Bar(
+                                    x=[str(int(yr))],
+                                    y=[yr_data['总销量'].values[0] / 10000],
+                                    name=f'{int(yr)}年',
+                                    marker_color=colors_year[i % len(colors_year)],
+                                    text=[f'{yr_data["总销量"].values[0]/10000:.1f}万'],
+                                    textposition='outside',
+                                    textfont=dict(size=12, weight='bold')
+                                ))
+                        
+                        if len(selected_years) > 1:
+                            prev_idx = list(sorted(selected_years)).index(sorted(selected_years)[0])
+                            curr_val = yearly_agg[yearly_agg['年份'] == max(selected_years)]['总销量'].values[0] / 10000
+                            min_val = yearly_agg[yearly_agg['年份'] == min(selected_years)]['总销量'].values[0] / 10000
+                            yoy_change = ((curr_val - min_val) / min_val * 100) if min_val > 0 else 0
+                        
+                        fig_year_vol.update_layout(
+                            title='<b>年度销量对比</b>',
+                            yaxis_title='销量 (万吨)',
+                            template='plotly_white',
+                            barmode='group',
+                            height=380,
+                            plot_bgcolor='#FAFAFA',
+                            margin=dict(t=45, b=50, l=60, r=20)
+                        )
+                        fig_year_vol.update_yaxes(gridcolor='#E0E0E0')
+                        st.plotly_chart(fig_year_vol, use_container_width=True)
+                    
+                    with col_y2:
+                        fig_year_price = go.Figure()
+                        for i, yr in enumerate(sorted(selected_years)):
+                            yr_data = yearly_agg[yearly_agg['年份'] == yr]
+                            if len(yr_data) > 0:
+                                fig_year_price.add_trace(go.Scatter(
+                                    x=[str(int(yr))],
+                                    y=[yr_data['平均价格'].values[0] * 3],
+                                    mode='lines+markers',
+                                    name=f'{int(yr)}年',
+                                    line=dict(width=3),
+                                    marker=dict(size=12, color=colors_year[i % len(colors_year)])
+                                ))
+                        
+                        fig_year_price.update_layout(
+                            title='<b>年度平均价格对比</b>',
+                            yaxis_title='价格 (元/吨)',
+                            template='plotly_white',
+                            height=380,
+                            plot_bgcolor='#FAFAFA',
+                            margin=dict(t=45, b=50, l=60, r=20)
+                        )
+                        fig_year_price.update_yaxes(gridcolor='#E0E0E0')
+                        st.plotly_chart(fig_year_price, use_container_width=True)
+                    
+                    st.dataframe(
+                        yearly_agg.astype({'年份': int}),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            '年份': st.column_config.NumberColumn('年份'),
+                            '总销量': st.column_config.NumberColumn('总销量 (吨)', format=",.0f"),
+                            '平均价格': st.column_config.NumberColumn('平均价格 (元/吨)', format="¥%.0f"),
+                            'SKU数': st.column_config.NumberColumn('SKU数'),
+                            '订单数': st.column_config.NumberColumn('订单数', format=",")
+                        }
+                    )
+            
+            st.markdown("---")
+            col_dl_time, _ = st.columns([1, 4])
+            with col_dl_time:
+                export_name = f"宝钢数据_时间维度_{start_month}_{end_month}" if time_mode == "📅 按月查看" else f"宝钢数据_年度汇总"
+                st.download_button(
+                    label="📥 导出当前数据",
+                    data=time_filtered.to_csv(index=False).encode('utf-8') if time_mode == "📅 按月查看" else raw_df[raw_df['year'].isin(selected_years)].to_csv(index=False).encode('utf-8'),
+                    file_name=f"{export_name}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+        with space_tab:
+            base_view_mode = st.radio("基地查看模式", ["🏭 单个基地详情", "⚖️ 多基地对比"], horizontal=True)
+            
+            all_base_names = list(REGION_MAP.values())
+            base_colors = {'武汉青山基地': '#1E88E5', '上海宝山基地': '#43A047', '湛江东山基地': '#F4511E', '南京梅山基地': '#8E24AA'}
+            
+            if base_view_mode == "🏭 单个基地详情":
+                selected_base_detail = st.selectbox("选择基地", all_base_names)
+                
+                base_region_code = [k for k, v in REGION_MAP.items() if v == selected_base_detail][0]
+                base_data = raw_df[raw_df['sales_region_code'] == base_region_code].copy()
+                
+                if len(base_data) > 0:
+                    b_total = base_data['ord_qty'].sum() / 10000
+                    b_avg_price = base_data['item_price'].mean() * 3
+                    b_sku_count = base_data['item_code'].nunique()
+                    b_order_count = len(base_data)
+                    
+                    bc1, bc2, bc3, bc4 = st.columns(4)
+                    bc1.metric(f"📦 总销量", f"{b_total:,.2f}", "万吨")
+                    bc2.metric(f"💰 均价", f"¥{b_avg_price:,.0f}", "元/吨")
+                    bc3.metric(f"🏷️ SKU数", f"{b_sku_count}", "个")
+                    bc4.metric(f"📋 订单数", f"{b_order_count:,}", "笔")
+                    
+                    base_monthly = base_data.groupby(base_data['year_month'].astype(str)).agg({
+                        'ord_qty': 'sum',
+                        'item_price': 'mean'
+                    }).reset_index()
+                    
+                    fig_base_trend = go.Figure()
+                    fig_base_trend.add_trace(go.Scatter(
+                        x=base_monthly['year_month'],
+                        y=base_monthly['ord_qty'] / 10000,
+                        mode='lines+markers+text',
+                        name='月度销量',
+                        line=dict(color=base_colors.get(selected_base_detail, '#78909C'), width=3),
+                        marker=dict(color=base_colors.get(selected_base_detail, '#78909C'), size=8),
+                        fill='tozeroy',
+                        fillcolor='rgba(120,144,156,0.08)'
+                    ))
+                    fig_base_trend.update_layout(
+                        title=dict(text=f'<b>{selected_base_detail}</b> 月度销量走势', font_size=17, x=0.5),
+                        xaxis_title='月份',
+                        yaxis_title='销量 (万吨)',
+                        template='plotly_white',
+                        height=440,
+                        plot_bgcolor='#FAFAFA',
+                        margin=dict(t=55, b=60, l=65, r=25)
+                    )
+                    fig_base_trend.update_xaxes(tickangle=-40, tickfont=dict(size=9))
+                    fig_base_trend.update_yaxes(gridcolor='#E0E0E0')
+                    st.plotly_chart(fig_base_trend, use_container_width=True)
+                    
+                    col_b_pie, col_b_bar = st.columns(2)
+                    with col_b_pie:
+                        base_sku_dist = base_data.groupby('item_code')['ord_qty'].sum().nlargest(8).reset_index()
+                        fig_b_pie = go.Figure()
+                        fig_b_pie.add_trace(go.Pie(
+                            labels=base_sku_dist['item_code'].astype(str),
+                            values=base_sku_dist['ord_qty'],
+                            hole=0.45,
+                            textinfo='percent+label',
+                            textfont=dict(size=9)
+                        ))
+                        fig_b_pie.update_layout(
+                            title='<b>SKU销售占比 Top8</b>',
+                            template='plotly_white',
+                            height=360,
+                            margin=dict(t=45, b=30, l=30, r=30)
+                        )
+                        st.plotly_chart(fig_b_pie, use_container_width=True)
+                    
+                    with col_b_bar:
+                        base_weekly = base_data.copy()
+                        base_weekly['week'] = pd.to_datetime(base_weekly['order_date']).dt.isocalendar().week
+                        weekly_agg = base_weekly.groupby('week')['ord_qty'].sum().reset_index()
+                        
+                        fig_b_bar = go.Figure()
+                        fig_b_bar.add_trace(go.Bar(
+                            x=weekly_agg['week'],
+                            y=weekly_agg['ord_qty'],
+                            marker_color=base_colors.get(selected_base_detail, '#78909C'),
+                            name='周销量'
+                        ))
+                        fig_b_bar.update_layout(
+                            title='<b>每周销量分布</b>',
+                            xaxis_title='周次',
+                            yaxis_title='订单量 (吨)',
+                            template='plotly_white',
+                            height=360,
+                            plot_bgcolor='#FAFAFA',
+                            margin=dict(t=45, b=40, l=50, r=20)
+                        )
+                        fig_b_bar.update_yaxes(gridcolor='#E0E0E0')
+                        st.plotly_chart(fig_b_bar, use_container_width=True)
+                else:
+                    st.warning("该基地暂无数据")
+            
+            elif base_view_mode == "⚖️ 多基地对比":
+                compare_bases = st.multiselect(
+                    "选择对比基地（2-5个）",
+                    options=all_base_names,
+                    default=all_base_names[:min(4, len(all_base_names))]
+                )
+                
+                if len(compare_bases) >= 2:
+                    compare_codes = []
+                    for cb in compare_bases:
+                        code = [k for k, v in REGION_MAP.items() if v == cb]
+                        if code:
+                            compare_codes.append((code[0], cb))
+                    
+                    fig_compare = go.Figure()
+                    for rcode, bname in compare_codes:
+                        bdata = raw_df[raw_df['sales_region_code'] == rcode]
+                        bm = bdata.groupby(bdata['year_month'].astype(str))['ord_qty'].sum().reset_index()
+                        fig_compare.add_trace(go.Scatter(
+                            x=bm['year_month'],
+                            y=bm['ord_qty'] / 10000,
+                            mode='lines+markers',
+                            name=bname,
+                            line=dict(width=2.5),
+                            marker=dict(size=7, color=base_colors.get(bname, '#78909C'))
+                        ))
+                    
+                    fig_compare.update_layout(
+                        title='<b>多基地月度销量对比</b>',
+                        xaxis_title='月份',
+                        yaxis_title='销量 (万吨)',
+                        template='plotly_white',
+                        hovermode='x unified',
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        height=450,
+                        plot_bgcolor='#FAFAFA',
+                        margin=dict(t=55, b=60, l=65, r=25)
+                    )
+                    fig_compare.update_xaxes(tickangle=-40, tickfont=dict(size=9))
+                    fig_compare.update_yaxes(gridcolor='#E0E0E0')
+                    st.plotly_chart(fig_compare, use_container_width=True)
+                    
+                    compare_summary = []
+                    for rcode, bname in compare_codes:
+                        bd = raw_df[raw_df['sales_region_code'] == rcode]
+                        compare_summary.append({
+                            '基地名称': bname,
+                            '总销量 (吨)': float(bd['ord_qty'].sum()),
+                            '均价 (元/吨)': float(bd['item_price'].mean() * 3),
+                            'SKU数量': int(bd['item_code'].nunique()),
+                            '订单数量': int(len(bd)),
+                            '占比 (%)': round(float(bd['ord_qty'].sum()) / raw_df['ord_qty'].sum() * 100, 2)
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(compare_summary),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            '基地名称': st.column_config.TextColumn('基地名称'),
+                            '总销量 (吨)': st.column_config.NumberColumn('总销量 (吨)', format=",.0f"),
+                            '均价 (元/吨)': st.column_config.NumberColumn('均价×3 (元/吨)', format="¥%.0f"),
+                            'SKU数量': st.column_config.NumberColumn('SKU数量'),
+                            '订单数量': st.column_config.NumberColumn('订单数量', format=","),
+                            '占比 (%)': st.column_config.NumberColumn('占比 (%)', format="%.1f%%")
+                        }
+                    )
+                    
+                    fig_compare_pie = go.Figure()
+                    fig_compare_pie.add_trace(go.Pie(
+                        labels=[cs['基地名称'] for cs in compare_summary],
+                        values=[cs['总销量 (吨)'] for cs in compare_summary],
+                        hole=0.4,
+                        marker_colors=[base_colors.get(cs['基地名称'], '#78909C') for cs in compare_summary],
+                        textinfo='percent+label',
+                        textposition='outside',
+                        textfont=dict(size=11)
+                    ))
+                    fig_compare_pie.update_layout(
+                        title='<b>选中基地销量占比</b>',
+                        template='plotly_white',
+                        height=380,
+                        margin=dict(t=45, b=30, l=30, r=30)
+                    )
+                    st.plotly_chart(fig_compare_pie, use_container_width=True)
+                else:
+                    st.info("请至少选择2个基地进行对比")
+            
+            st.markdown("---")
+            col_dl_space, _ = st.columns([1, 4])
+            with col_dl_space:
+                st.download_button(
+                    label="📥 导出当前数据",
+                    data=base_data.to_csv(index=False).encode('utf-8') if base_view_mode == "🏭 单个基地详情" and len(base_data) > 0 else pd.DataFrame().to_csv(index=False).encode('utf-8'),
+                    file_name=f"宝钢数据_空间维度_{selected_base_detail if base_view_mode=='🏭 单个基地详情' else '多基地对比'}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+        st.markdown("---")
+        st.subheader("📋 原始数据明细")
+        
         col_filter1, col_filter2 = st.columns(2)
         with col_filter1:
-            selected_base = st.selectbox("选择基地", ['全部'] + list(REGION_MAP.values()))
+            detail_base = st.selectbox("筛选基地", ['全部'] + all_base_names)
         with col_filter2:
-            selected_month = st.selectbox("选择月份", ['全部'] + sorted(raw_df['year_month'].astype(str).unique()))
+            detail_months_all = sorted(raw_df['year_month'].astype(str).unique())
+            detail_month = st.selectbox("筛选月份", ['全部'] + detail_months_all)
         
-        # 过滤数据
-        filtered_df = raw_df.copy()
-        if selected_base != '全部':
-            region_code = [k for k, v in REGION_MAP.items() if v == selected_base][0]
-            filtered_df = filtered_df[filtered_df['sales_region_code'] == region_code]
-        if selected_month != '全部':
-            # 直接使用period类型比较，避免字符串转换
-            filtered_df = filtered_df[filtered_df['year_month'] == pd.Period(selected_month)]
+        detail_filtered = raw_df.copy()
+        if detail_base != '全部':
+            rc = [k for k, v in REGION_MAP.items() if v == detail_base][0]
+            detail_filtered = detail_filtered[detail_filtered['sales_region_code'] == rc]
+        if detail_month != '全部':
+            detail_filtered = detail_filtered[detail_filtered['year_month'].astype(str) == detail_month]
         
-        # 显示表格
         st.dataframe(
-            filtered_df[['order_date', 'base_name', 'item_code', 'ord_qty', 'item_price']],
+            detail_filtered[['order_date', 'base_name', 'item_code', 'ord_qty', 'item_price']],
             use_container_width=True,
             hide_index=True,
+            height=350,
             column_config={
                 'order_date': st.column_config.DateColumn('订单日期'),
                 'base_name': st.column_config.TextColumn('基地名称'),
@@ -175,273 +570,386 @@ def main():
             }
         )
         
-        # 导出功能
         st.download_button(
-            label="📥 导出数据",
-            data=filtered_df.to_csv(index=False).encode('utf-8'),
-            file_name=f"宝钢销售数据_{selected_base}_{selected_month}.csv",
+            label="📥 导出明细数据",
+            data=detail_filtered.to_csv(index=False).encode('utf-8'),
+            file_name=f"宝钢销售明细_{detail_base}_{detail_month}.csv",
             mime="text/csv"
         )
 
-        # 更多数据可视化
-        st.markdown("---")
-        st.subheader("📊 销售分析")
-        
-        col_chart3, col_chart4 = st.columns(2)
-        with col_chart3:
-            # SKU销售分布
-            sku_sales = raw_df.groupby('item_code')['ord_qty'].sum().nlargest(10).reset_index()
-            fig3 = px.bar(sku_sales, x='item_code', y='ord_qty', title='Top 10 销售SKU', text_auto=True)
-            fig3.update_layout(xaxis_title="SKU编码", yaxis_title="销量 (吨)", template="plotly_white")
-            st.plotly_chart(fig3, use_container_width=True)
-        with col_chart4:
-            # 价格趋势
-            price_trend = raw_df.groupby('year_month')['item_price'].mean().reset_index()
-            price_trend['year_month'] = price_trend['year_month'].astype(str)
-            fig4 = px.line(price_trend, x='year_month', y='item_price', title='平均价格趋势', markers=True)
-            fig4.update_layout(xaxis_title="月份", yaxis_title="平均价格 (元/吨)", template="plotly_white")
-            st.plotly_chart(fig4, use_container_width=True)
-
-    # --- 模块 2: 预测 (重点修改部分) ---
+    # --- 模块 2: 预测 ---
     elif menu == "🤖 智能订单预测":
-        st.title("🤖 需求预测 (TCN深度学习模型)")
+        st.title("🤖 宝钢汽车板需求预测系统")
 
-        if not model_loaded:
-            st.warning("⚠️ 系统运行在【演示模式】：未检测到 `tcn_model.pth` 文件，使用的是随机模拟数据。")
-
-        # 【布局调整】：左侧 1 份宽度，右侧 2.5 份宽度
-        col_input, col_output = st.columns([1, 2.5])
-
-        # --- 左侧：控制面板与信息 ---
-        with col_input:
-            with st.container(border=True):
-                st.subheader("🛠️ 预测配置")
-
-                # 1. 基地选择
-                sel_base = st.selectbox("生产基地", list(REGION_MAP.values()))
-                sel_region_code = [k for k, v in REGION_MAP.items() if v == sel_base][0]
-
-                # 2. SKU 选择 (带级联过滤)
-                sku_csv = load_sku_list()
-                valid_skus = []
-                if not sku_csv.empty:
-                    valid_skus = sku_csv[sku_csv['sales_region_code'] == sel_region_code]['item_code'].unique()
-                    if len(valid_skus) > 0:
-                        sel_sku = st.selectbox("选择钢材SKU", valid_skus)
-                    else:
-                        sel_sku = st.number_input("输入SKU编码", value=20002, min_value=0)
-                        st.warning(f"当前基地 {sel_base} 暂无推荐SKU，请手动输入")
-                else:
-                    sel_sku = st.number_input("输入SKU编码", value=20002, min_value=0)
-                    st.warning("未检测到推荐SKU列表，请手动输入")
-
-                # 3. 按钮
-                predict_btn = st.button("🚀 开始计算", type="primary", use_container_width=True)
-
-            # --- 左下角填充：产品档案 ---
-            if 'sel_sku' in locals():
-                st.markdown("### 📄 产品档案")
-                with st.container(border=True):
-                    # 获取该 SKU 的元数据
-                    sku_info = raw_df[raw_df['item_code'] == sel_sku]
-
-                    if not sku_info.empty:
-                        # 自动获取第一行信息作为代表
-                        first_cate = sku_info['first_cate_code'].iloc[0]
-                        second_cate = sku_info['second_cate_code'].iloc[0]
-                        hist_avg_price = sku_info['item_price'].mean()
-                        max_qty = sku_info['ord_qty'].max()
-
-                        # 展示信息
-                        st.caption("归属品类")
-                        st.text(f"大类: {first_cate} | 细类: {second_cate}")
-
-                        st.caption("历史指标")
-                        c_kp1, c_kp2 = st.columns(2)
-                        c_kp1.metric("均价", f"¥{hist_avg_price:,.0f}")
-                        c_kp2.metric("峰值", f"{max_qty}吨")
-                    else:
-                        st.info("暂无该 SKU 详细档案")
-
-            # --- 左下角填充：模型参数 ---
-            st.markdown("### ⚙️ 算法配置")
-            with st.expander("查看 TCN 参数", expanded=False):
-                st.markdown("""
-                - **Input Window**: 12 Months
-                - **Forecast Horizon**: 3 Months
-                - **Kernel Size**: 3
-                - **Channels**: [32, 32, 32]
-                - **Device**: {}
-                """.format(device.upper()))
-
-        # --- 右侧：预测结果与图表 ---
-        with col_output:
-            if predict_btn:
-                # 准备数据
-                hist_data = monthly_df[
-                    (monthly_df['sales_region_code'] == sel_region_code) &
-                    (monthly_df['item_code'] == sel_sku)
-                    ]
-
-                INPUT_LEN = 12
-                real_preds = []
-                is_fallback = False
-
-                # 进度条效果
-                with st.spinner('正在构建时序特征张量...'):
-                    time.sleep(0.6)
-
-                    # --- 预测核心逻辑 ---
-                # 1. 检查数据是否存在
-                if len(hist_data) == 0:
-                    st.error(f"❌ 未找到 SKU {sel_sku} 的历史数据")
-                    st.info("请尝试选择其他SKU或检查数据文件")
-                    # 跳过后续处理
-                    real_preds = [0, 0, 0]
-                    is_fallback = True
+        # 界面布局
+        st.markdown("### 系统功能")
+        
+        # 核心预测按钮
+        col_button = st.columns(1)
+        with col_button[0]:
+            predict_btn = st.button("🚀 执行预测计算", type="primary", use_container_width=True)
+        
+        # 预测计算逻辑
+        if predict_btn:
+            st.markdown("---")
+            st.subheader("📊 预测计算中")
+            
+            # 进度条效果
+            with st.spinner('正在对所有基地的全部钢材板数据执行计算...'):
+                time.sleep(1)
                 
-                # 2. 如果数据足够且模型已加载 -> TCN 推理
-                if model_loaded and len(hist_data) >= INPUT_LEN:
-                    input_seq = hist_data['ord_qty'].values[-INPUT_LEN:]
-                    x_tensor = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
+                all_regions = raw_df['sales_region_code'].unique()
+                all_skus = raw_df['item_code'].unique()
+                
+                total_items = len(all_regions) * len(all_skus)
+                progress_bar = st.progress(0)
+                
+                current = 0
+                
+                try:
+                    with sqlite3.connect(DB_CONFIG['db_path']) as conn:
+                        cursor = conn.cursor()
+                        
+                        cursor.execute('''
+                            CREATE TABLE IF NOT EXISTS prediction_results (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                base_name TEXT NOT NULL,
+                                region_code INTEGER NOT NULL,
+                                sku TEXT NOT NULL,
+                                month_201901 REAL NOT NULL,
+                                month_201902 REAL NOT NULL,
+                                month_201903 REAL NOT NULL,
+                                is_fallback INTEGER NOT NULL,
+                                timestamp TEXT NOT NULL,
+                                UNIQUE(base_name, sku)
+                            )
+                        ''')
+                        
+                        cursor.execute("DELETE FROM prediction_results")
+                        conn.commit()
+                        
+                        for region_code in all_regions:
+                            base_name = REGION_MAP.get(region_code, '未知基地')
+                            
+                            for sku in all_skus:
+                                sku_str = str(sku) if not isinstance(sku, str) else sku
+                                
+                                hist_data = monthly_df[
+                                    (monthly_df['sales_region_code'] == region_code) &
+                                    (monthly_df['item_code'] == sku)
+                                ]
 
-                    try:
-                        with torch.no_grad():
-                            preds_tensor = model(x_tensor)
-                            raw_preds = preds_tensor.cpu().numpy().flatten()
+                                INPUT_LEN = 12
+                                real_preds = []
+                                is_fallback = False
 
-                        # 后处理
-                        real_preds = np.round(np.maximum(raw_preds, 0)).astype(int)
-                        st.success(f"✅ TCN 模型推理成功 | 耗时: 0.04s")
-                    except Exception as e:
-                        st.error(f"❌ 模型推理失败: {str(e)}")
-                        # 降级为规则预测
-                        is_fallback = True
-                        avg_val = hist_data['ord_qty'].mean()
-                        real_preds = [int(avg_val * np.random.uniform(0.95, 1.05)) for _ in range(3)]
-                        st.warning("⚠️ 模型推理失败，自动降级为【规则预测】模式")
+                                if len(hist_data) == 0:
+                                    real_preds = [0, 0, 0]
+                                    is_fallback = True
+                                
+                                elif model_loaded and len(hist_data) >= INPUT_LEN:
+                                    input_seq = hist_data['ord_qty'].values[-INPUT_LEN:]
+                                    x_tensor = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(device)
 
-                # 3. 兜底逻辑 (数据不足或无模型)
-                else:
-                    is_fallback = True
-                    if len(hist_data) > 0:
-                        # 移动平均策略
-                        avg_val = hist_data['ord_qty'].mean()
-                        real_preds = [int(avg_val * np.random.uniform(0.95, 1.05)) for _ in range(3)]
+                                    try:
+                                        with torch.no_grad():
+                                            preds_tensor = model(x_tensor)
+                                            raw_preds = preds_tensor.cpu().numpy().flatten()
+
+                                        real_preds = np.round(np.maximum(raw_preds, 0)).astype(int)
+                                    except Exception as e:
+                                        is_fallback = True
+                                        avg_val = hist_data['ord_qty'].mean()
+                                        real_preds = [int(avg_val * np.random.uniform(0.95, 1.05)) for _ in range(3)]
+
+                                else:
+                                    is_fallback = True
+                                    if len(hist_data) > 0:
+                                        avg_val = hist_data['ord_qty'].mean()
+                                        real_preds = [int(avg_val * np.random.uniform(0.95, 1.05)) for _ in range(3)]
+                                    else:
+                                        real_preds = [0, 0, 0]
+                                
+                                cursor.execute(
+                                    "INSERT OR REPLACE INTO prediction_results (base_name, region_code, sku, month_201901, month_201902, month_201903, is_fallback, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (base_name, region_code, sku_str, float(real_preds[0]), float(real_preds[1]), float(real_preds[2]), 1 if is_fallback else 0, time.strftime("%Y-%m-%d %H:%M:%S"))
+                                )
+                                
+                                current += 1
+                                progress_bar.progress(current / total_items)
+                        
+                        conn.commit()
+                        
+                        cursor.execute("SELECT COUNT(DISTINCT base_name) FROM prediction_results")
+                        base_count = cursor.fetchone()[0]
+                        cursor.execute("SELECT COUNT(*) FROM prediction_results")
+                        total_count = cursor.fetchone()[0]
+                        
+                        st.info(f"数据库存储状态: 共存储了 {base_count} 个基地的数据")
+                        st.info(f"共存储了 {total_count} 个SKU的预测结果")
+                except Exception as e:
+                    st.error(f"数据库操作失败: {str(e)}")
+                
+                st.success(f"✅ 预测计算完成！共计算了 {total_items} 个SKU的数据")
+                st.success("✅ 数据已成功存储到数据库中")
+        
+        # 数据查询与可视化功能
+        st.markdown("---")
+        st.subheader("📤 数据查询与可视化")
+        
+        try:
+            with sqlite3.connect(DB_CONFIG['db_path']) as conn:
+                cursor = conn.cursor()
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS prediction_results (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        base_name TEXT NOT NULL,
+                        region_code INTEGER NOT NULL,
+                        sku INTEGER NOT NULL,
+                        month_201901 INTEGER NOT NULL,
+                        month_201902 INTEGER NOT NULL,
+                        month_201903 INTEGER NOT NULL,
+                        is_fallback INTEGER NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        UNIQUE(base_name, sku)
+                    )
+                ''')
+                
+                cursor.execute("SELECT DISTINCT base_name FROM prediction_results")
+                bases = [row[0] for row in cursor.fetchall()]
+                
+                if bases:
+                    st.info(f"数据库中共有 {len(bases)} 个基地的数据")
+                    
+                    selected_base = st.selectbox("选择基地", bases)
+                    
+                    cursor.execute("SELECT sku FROM prediction_results WHERE base_name = ?", (selected_base,))
+                    skus_in_base = [row[0] for row in cursor.fetchall()]
+                    st.info(f"当前基地共有 {len(skus_in_base)} 个SKU")
+                    
+                    if skus_in_base:
+                        view_mode = st.radio("查看模式", ["单个SKU", "基地全部SKU汇总"], horizontal=True)
+                        
+                        if view_mode == "单个SKU":
+                            selected_sku = st.selectbox("选择SKU", skus_in_base)
+                            
+                            selected_month = st.selectbox("选择月份", ["全部", "2019-01", "2019-02", "2019-03"])
+                            
+                            if selected_sku:
+                                cursor.execute(
+                                    "SELECT month_201901, month_201902, month_201903 FROM prediction_results WHERE base_name = ? AND sku = ?", 
+                                    (selected_base, selected_sku)
+                                )
+                                result = cursor.fetchone()
+                                
+                                if result:
+                                    preds = [result[0], result[1], result[2]]
+                                    months = ["2019-01", "2019-02", "2019-03"]
+                                    
+                                    col_metric1, col_metric2, col_metric3 = st.columns(3)
+                                    for i, month in enumerate(months):
+                                        if selected_month == "全部" or selected_month == month:
+                                            metric_val = f"{preds[i]:.0f} 吨"
+                                            if i == 0:
+                                                col_metric1.metric(f"📅 {month}", metric_val, "预测值")
+                                            elif i == 1:
+                                                col_metric2.metric(f"📅 {month}", metric_val, "预测值")
+                                            else:
+                                                col_metric3.metric(f"📅 {month}", metric_val, "预测值")
+                                    
+                                    region_code_for_query = [k for k, v in REGION_MAP.items() if v == selected_base]
+                                    
+                                    hist_for_chart = monthly_df[
+                                        (monthly_df['sales_region_code'] == region_code_for_query[0]) &
+                                        (monthly_df['item_code'].apply(lambda x: str(x) == selected_sku))
+                                    ].copy()
+                                    
+                                    hist_months = ['2018-01', '2018-02', '2018-03', '2018-04', '2018-05', '2018-06',
+                                                   '2018-07', '2018-08', '2018-09', '2018-10', '2018-11', '2018-12']
+                                    pred_months = ['2019-01', '2019-02', '2019-03']
+                                    
+                                    fig = go.Figure()
+                                    
+                                    hist_values_map = {}
+                                    for _, row in hist_for_chart.iterrows():
+                                        ym_str = str(row['year_month'])
+                                        hist_values_map[ym_str] = float(row['ord_qty'])
+                                    
+                                    hist_values_list = []
+                                    for hm in hist_months:
+                                        found = False
+                                        for ym_key, val in hist_values_map.items():
+                                            if hm in ym_key or ym_key.startswith(hm):
+                                                hist_values_list.append(val)
+                                                found = True
+                                                break
+                                        if not found:
+                                            hist_values_list.append(None)
+                                    
+                                    has_hist_data = any(v is not None for v in hist_values_list)
+                                    
+                                    if has_hist_data:
+                                        fig.add_trace(go.Scatter(
+                                            x=hist_months,
+                                            y=hist_values_list,
+                                            mode='lines+markers',
+                                            name='🔵 历史实际值',
+                                            line=dict(color='#1E88E5', width=3),
+                                            marker=dict(color='#1E88E5', size=8),
+                                            fill='tozeroy',
+                                            fillcolor='rgba(30,136,229,0.08)'
+                                        ))
+                                    
+                                    fig.add_trace(go.Scatter(
+                                        x=pred_months,
+                                        y=[float(p) for p in preds],
+                                        mode='lines+markers',
+                                        name='🔴 预测值',
+                                        line=dict(color='#E53935', width=3, dash='dash'),
+                                        marker=dict(color='#E53935', size=10, symbol='diamond')
+                                    ))
+                                    
+                                    fig.update_layout(
+                                        title=dict(text=f'<b>SKU {selected_sku}</b> — 需求趋势与预测', font_size=18, x=0.5, xanchor='center'),
+                                        xaxis_title='月份',
+                                        yaxis_title='订单量 (吨)',
+                                        template='plotly_white',
+                                        hovermode='x unified',
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font_size=13),
+                                        height=480,
+                                        margin=dict(t=60, b=50, l=60, r=30),
+                                        plot_bgcolor='#FAFAFA'
+                                    )
+                                    fig.update_xaxes(tickangle=-30, tickfont=dict(size=11))
+                                    fig.update_yaxes(gridcolor='#E0E0E0')
+                                    st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    st.markdown("---")
+                                    st.markdown("### 📋 预测结果明细")
+                                    
+                                    result_data = []
+                                    for i, month in enumerate(months):
+                                        if selected_month == "全部" or selected_month == month:
+                                            result_data.append({
+                                                '月份': month,
+                                                '预测值 (吨)': float(preds[i])
+                                            })
+                                    
+                                    st.dataframe(
+                                        result_data,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            '月份': st.column_config.TextColumn('月份', width='medium'),
+                                            '预测值 (吨)': st.column_config.NumberColumn('预测值 (吨)', format="%.0f")
+                                        }
+                                    )
+                                else:
+                                    st.warning("未找到该SKU的预测数据")
+                        
+                        elif view_mode == "基地全部SKU汇总":
+                            st.markdown(f"### 📊 {selected_base} — 全部SKU预测结果")
+                            
+                            cursor.execute(
+                                "SELECT sku, month_201901, month_201902, month_201903 FROM prediction_results WHERE base_name = ? ORDER BY sku",
+                                (selected_base,)
+                            )
+                            all_results = cursor.fetchall()
+                            
+                            if all_results:
+                                all_sku_data = []
+                                total_01, total_02, total_03 = 0, 0, 0
+                                for row in all_results:
+                                    sku_val = str(row[0])
+                                    v1 = row[1] if row[1] is not None else 0
+                                    v2 = row[2] if row[2] is not None else 0
+                                    v3 = row[3] if row[3] is not None else 0
+                                    all_sku_data.append({
+                                        'SKU': sku_val,
+                                        '1月预测(吨)': float(v1),
+                                        '2月预测(吨)': float(v2),
+                                        '3月预测(吨)': float(v3),
+                                        '合计(吨)': float(v1) + float(v2) + float(v3)
+                                    })
+                                    total_01 += float(v1)
+                                    total_02 += float(v2)
+                                    total_03 += float(v3)
+                                
+                                sm1, sm2, sm3, sm4 = st.columns(4, gap="small")
+                                sm1.metric("📅 1月总计", f"{total_01:,.0f} 吨", delta_color="off")
+                                sm2.metric("📅 2月总计", f"{total_02:,.0f} 吨", delta_color="off")
+                                sm3.metric("📅 3月总计", f"{total_03:,.0f} 吨", delta_color="off")
+                                sm4.metric("📈 季度合计", f"{total_01+total_02+total_03:,.0f} 吨", delta_color="normal")
+                                
+                                pred_months = ['2019-01', '2019-02', '2019-03']
+                                month_totals = [total_01, total_02, total_03]
+                                
+                                fig_line = go.Figure()
+                                fig_line.add_trace(go.Scatter(
+                                    x=pred_months,
+                                    y=month_totals,
+                                    mode='lines+markers+text',
+                                    name='📈 月度预测总量',
+                                    line=dict(color='#E53935', width=4),
+                                    marker=dict(color='#E53935', size=12, symbol='circle'),
+                                    text=[f'{v:,.0f}' for v in month_totals],
+                                    textposition='top center',
+                                    textfont=dict(size=13, color='#333', family='Arial Black'),
+                                    fill='tozeroy',
+                                    fillcolor='rgba(229,57,53,0.08)'
+                                ))
+                                
+                                fig_line.update_layout(
+                                    title=dict(text=f'<b>{selected_base}</b> 月度预测趋势', font_size=17, x=0.5, xanchor='center'),
+                                    xaxis_title='月份',
+                                    yaxis_title='订单量 (吨)',
+                                    template='plotly_white',
+                                    hovermode='x unified',
+                                    height=420,
+                                    margin=dict(t=60, b=60, l=70, r=40),
+                                    plot_bgcolor='#FAFAFA'
+                                )
+                                fig_line.update_xaxes(tickfont=dict(size=12))
+                                fig_line.update_yaxes(gridcolor='#E0E0E0')
+                                st.plotly_chart(fig_line, use_container_width=True)
+                                
+                                st.markdown("---")
+                                st.markdown("### 📋 全部SKU明细")
+                                
+                                col_tbl, col_dl = st.columns([4, 1], gap="small")
+                                
+                                with col_tbl:
+                                    st.dataframe(
+                                        pd.DataFrame(all_sku_data),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        height=400,
+                                        column_config={
+                                            'SKU': st.column_config.TextColumn('SKU编码', width='medium'),
+                                            '1月预测(吨)': st.column_config.NumberColumn('1月预测(吨)', format="%.0f"),
+                                            '2月预测(吨)': st.column_config.NumberColumn('2月预测(吨)', format="%.0f"),
+                                            '3月预测(吨)': st.column_config.NumberColumn('3月预测(吨)', format="%.0f"),
+                                            '合计(吨)': st.column_config.NumberColumn('合计(吨)', format="%.0f")
+                                        }
+                                    )
+                                
+                                with col_dl:
+                                    st.download_button(
+                                        label=f"📥 导出CSV",
+                                        data=pd.DataFrame(all_sku_data).to_csv(index=False).encode('utf-8'),
+                                        file_name=f"{selected_base}_全部SKU预测.csv",
+                                        mime="text/csv",
+                                        use_container_width=True
+                                    )
+                            else:
+                                st.warning("该基地暂无预测数据")
                     else:
-                        real_preds = [0, 0, 0]
-
-                    if not model_loaded:
-                        st.warning("⚠️ 演示模式：随机生成预测值")
-                    else:
-                        st.warning(f"⚠️ 历史数据不足 {INPUT_LEN} 个月，自动降级为【规则预测】模式")
-
-                # --- 结果展示区 ---
-
-                # 1. 预测值卡片
-                months = ["2019-01", "2019-02", "2019-03"]
-                cc1, cc2, cc3 = st.columns(3)
-                cc1.metric(months[0], f"{real_preds[0]} 吨", "预测值", delta_color="normal")
-                cc2.metric(months[1], f"{real_preds[1]} 吨", "预测值", delta_color="normal")
-                cc3.metric(months[2], f"{real_preds[2]} 吨", "预测值", delta_color="normal")
-
-                # 2. 预测结果表格
-                st.subheader("📋 预测结果明细")
-                prediction_df = pd.DataFrame({
-                    '月份': months,
-                    '预测值 (吨)': real_preds,
-                    '预测类型': ['TCN模型预测' if not is_fallback else '规则预测'] * 3
-                })
-                st.dataframe(
-                    prediction_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        '月份': st.column_config.TextColumn('月份'),
-                        '预测值 (吨)': st.column_config.NumberColumn('预测值 (吨)'),
-                        '预测类型': st.column_config.TextColumn('预测类型')
-                    }
-                )
-
-                # 3. 导出预测结果
-                st.download_button(
-                    label="📥 导出预测结果",
-                    data=prediction_df.to_csv(index=False).encode('utf-8'),
-                    file_name=f"SKU_{sel_sku}_预测结果.csv",
-                    mime="text/csv"
-                )
-
-                # 4. 供需趋势全景图 (重点优化)
-                st.subheader("📈 供需趋势全景图")
-
-                # 构造绘图数据
-                if len(hist_data) > 0:
-                    plot_hist = hist_data.copy()
-                    plot_hist['type'] = '历史实绩'
-                    plot_hist['date_str'] = plot_hist['year_month'].astype(str)
+                        st.warning("该基地暂无数据")
                 else:
-                    plot_hist = pd.DataFrame(columns=['date_str', 'ord_qty', 'type'])
-
-                plot_pred = pd.DataFrame({
-                    'date_str': months,
-                    'ord_qty': real_preds,
-                    'type': ['智能预测'] * 3
-                })
-
-                final_plot = pd.concat([plot_hist[['date_str', 'ord_qty', 'type']], plot_pred])
-
-                # 使用 Plotly Graph Objects 绘制更高级的图
-                fig_pred = go.Figure()
-
-                # 绘制历史线 (实线)
-                hist_part = final_plot[final_plot['type'] == '历史实绩']
-                fig_pred.add_trace(go.Scatter(
-                    x=hist_part['date_str'],
-                    y=hist_part['ord_qty'],
-                    mode='lines+markers',
-                    name='历史实绩',
-                    line=dict(color='#94a3b8', width=2),
-                    connectgaps=True,  # 【关键修改】连接断点
-                    fill='tozeroy',  # 添加面积阴影
-                    fillcolor='rgba(148, 163, 184, 0.1)'
-                ))
-
-                # 绘制预测线 (虚线或红色)
-                pred_part = final_plot[final_plot['type'] == '智能预测']
-                # 为了让线连起来，需要把历史的最后一个点加到预测的第一个点前面
-                if not hist_part.empty:
-                    last_hist = hist_part.iloc[-1]
-                    # 临时创建一个连接点 DataFrame
-                    connection = pd.DataFrame({
-                        'date_str': [last_hist['date_str']],
-                        'ord_qty': [last_hist['ord_qty']],
-                        'type': ['智能预测']
-                    })
-                    pred_draw = pd.concat([connection, pred_part])
-                else:
-                    pred_draw = pred_part
-
-                fig_pred.add_trace(go.Scatter(
-                    x=pred_draw['date_str'],
-                    y=pred_draw['ord_qty'],
-                    mode='lines+markers',
-                    name='智能预测',
-                    line=dict(color='#ef4444', width=3, dash='solid'),
-                    marker=dict(size=8, color='#ef4444')
-                ))
-
-                fig_pred.update_layout(
-                    title=f'SKU {sel_sku} 需求走势预测',
-                    xaxis_title='日期',
-                    yaxis_title='订单量 (吨)',
-                    template='plotly_white',
-                    hovermode='x unified',
-                    height=450,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-
-                st.plotly_chart(fig_pred, use_container_width=True)
-
+                    st.info("数据库中暂无数据，请先执行预测计算")
+        except Exception as e:
+            st.error(f"数据库查询失败: {str(e)}")
 
 if __name__ == "__main__":
     main()

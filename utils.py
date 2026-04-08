@@ -2,19 +2,28 @@ import pandas as pd
 import torch
 from models import TCN
 
-# 区域映射字典
+# 区域映射字典（4个基地）
 REGION_MAP = {
-    101: '上海宝山基地 (HQ)', 102: '武汉青山基地', 103: '湛江东山基地',
-    104: '南京梅山基地', 105: '韶关钢铁基地'
+    102: '武汉青山基地',
+    101: '上海宝山基地',
+    103: '湛江东山基地',
+    100: '南京梅山基地'
+}
+
+
+BASE_REMAP = {
+    105: 102,
+    102: 101,
+    101: 103,
+    103: 100,
+    104: 102
 }
 
 
 def load_tcn_model():
-    """加载pth模型"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = TCN()
     try:
-        # map_location 确保在没有 GPU 的电脑上也能跑
         model.load_state_dict(torch.load("./tcn_model.pth", map_location=torch.device('cpu')))
         model.to(device)
         model.eval()
@@ -26,15 +35,17 @@ def load_tcn_model():
 
 
 def load_and_process_data():
-    """读取并清洗数据"""
     try:
         df = pd.read_csv('order_train0.csv')
 
         df['order_date'] = pd.to_datetime(df['order_date'])
+        
+        df['sales_region_code'] = df['sales_region_code'].map(BASE_REMAP).fillna(df['sales_region_code'])
+        df['sales_region_code'] = df['sales_region_code'].astype(int)
+        
         df['base_name'] = df['sales_region_code'].map(REGION_MAP).fillna('其他协同工厂')
         df['year_month'] = df['order_date'].dt.to_period("M")
 
-        # 聚合为月度数据 (用于TCN输入)
         monthly_df = (
             df.groupby(["sales_region_code", "item_code", "year_month"])["ord_qty"]
             .sum()
@@ -54,5 +65,4 @@ def load_sku_list():
 
 
 def get_device():
-    """获取设备信息"""
     return "cuda" if torch.cuda.is_available() else "cpu"
